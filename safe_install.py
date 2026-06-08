@@ -18,6 +18,8 @@
 #   -y / --yes     don't prompt on warnings, just proceed
 #   --dry-run      scan only, don't actually run the install
 #   --no-check     bypass everything (emergency escape hatch)
+#   --no-scan      skip source tarball download + analysis (faster)
+#   --whitelist F  only allow packages listed in file F
 
 import sys
 import os
@@ -27,9 +29,13 @@ import subprocess
 import urllib.request
 import urllib.error
 import urllib.parse
+import tempfile
+import tarfile
+import zipfile
+import shutil
 from datetime import datetime, timezone
 
-VERSION = "1.0.0"
+VERSION = "2.0.0"
 
 # Fix Windows console encoding — without this any non-ASCII in package
 # descriptions will throw UnicodeEncodeError on cp932/cp1252 terminals
@@ -516,10 +522,438 @@ def _check_namespace(pkg, pm):
 
 
 # ---------------------------------------------------------------------------
+# Homoglyph / confusable character detection
+#
+# Unicode substitution attacks: "rеquests" uses Cyrillic е (U+0435)
+# instead of Latin e (U+0065).  Levenshtein sees 0 edits because the
+# glyph count is the same.  We normalize confusable chars to ASCII and
+# re-check against popular packages.
+# ---------------------------------------------------------------------------
+
+# Map of Unicode chars that look like ASCII letters to their ASCII equivalent.
+# This covers the most common attack vectors (Cyrillic, Greek, math symbols).
+# Not exhaustive — there are 4000+ confusables in Unicode — but these are the
+# ones that actually show up in package name attacks.
+_CONFUSABLES = str.maketrans({
+    # Cyrillic -> Latin
+    "\u0430": "a", "\u0435": "e", "\u043e": "o", "\u0440": "p",
+    "\u0441": "c", "\u0443": "y", "\u0445": "x", "\u0456": "i",
+    "\u0458": "j", "\u04bb": "h", "\u0455": "s", "\u0442": "t",
+    "\u0432": "v", "\u043a": "k", "\u043c": "m", "\u043d": "n",
+    "\u0410": "A", "\u0412": "B", "\u0415": "E", "\u041a": "K",
+    "\u041c": "M", "\u041d": "H", "\u041e": "O", "\u0420": "P",
+    "\u0421": "C", "\u0422": "T", "\u0425": "X",
+    # Greek -> Latin
+    "\u03b1": "a", "\u03b5": "e", "\u03b9": "i", "\u03bf": "o",
+    "\u03c1": "p", "\u03c5": "u", "\u03ba": "k", "\u03bd": "v",
+    # Common lookalikes
+    "\u0131": "i",  # dotless i
+    "\u0049": "I",  # sometimes capital I is used for lowercase l
+    "\u006c": "l",  # itself, but check I/l confusion:
+    "\u2010": "-", "\u2011": "-", "\u2012": "-", "\u2013": "-",
+    "\u2014": "-", "\u2212": "-",  # various dashes -> hyphen
+    "\uff0d": "-",  # fullwidth hyphen
+    "\u2024": ".", "\uff0e": ".",  # one-dot leader, fullwidth period
+    "\uff3f": "_", "\u2017": "_",  # fullwidth underscore, double-low-line
+})
+
+
+def _normalize_confusables(name):
+    """Normalize confusable Unicode characters to ASCII."""
+    return name.translate(_CONFUSABLES)
+
+
+def _check_homoglyphs(pkg, pm):
+    """Detect Unicode character substitution attacks."""
+    normalized = _normalize_confusables(pkg)
+    if normalized == pkg:
+        return []  # no confusable characters present
+
+    # The name contained non-ASCII lookalikes.  Check if the normalized
+    # form matches a known popular package.
+    if pm in ("npm", "yarn", "pnpm"):
+        pool = _TOP_NPM
+    elif pm in ("pip", "pip3", "uv"):
+        pool = _TOP_PIP
+    elif pm == "cargo":
+        pool = _TOP_CARGO
+    elif pm == "gem":
+        pool = _TOP_GEMS
+    else:
+        pool = []
+
+    norm_lower = normalized.lower()
+    for ref in pool:
+        if norm_lower == ref.lower():
+            return [f"contains Unicode lookalike characters — looks like '{ref}' but isn't"]
+    # Even if we don't find a match in our list, the presence of confusable
+    # chars in a package name is suspicious on its own.
+    return [f"contains confusable Unicode characters (normalized: '{normalized}')"]
+
+
+# ---------------------------------------------------------------------------
+# Source tarball analysis
+#
+# This is the heavy check.  We download the actual package archive and
+# scan the source files for patterns that show up in real supply chain
+# attacks: env var exfiltration, obfuscated payloads, reverse shells,
+# credential file access, etc.
+#
+# Only runs for npm and pip packages (others don't have a convenient
+# single-tarball download).  Skip with --no-scan.
+# ---------------------------------------------------------------------------
+
+# Patterns to look for in source files.  These are regex patterns, each with
+# a severity and a short description.  We scan up to 50KB per file.
+_SOURCE_SCAN_PATTERNS = [
+    # Environment variable theft — the #1 payload in npm/pip malware
+    (r"process\.env\b.{0,80}(http|fetch|request|axios|got\(|\.send|\.post)",
+     "high", "reads process.env and makes HTTP request (env exfil pattern)"),
+    (r"os\.environ\b.{0,80}(urlopen|requests?\.|httpx\.|urllib|http\.client)",
+     "high", "reads os.environ and makes HTTP request (env exfil pattern)"),
+
+    # Obfuscated code — long base64/hex blobs are a dead giveaway
+    (r"['\"][A-Za-z0-9+/]{200,}={0,2}['\"]",
+     "high", "large base64-encoded string (>200 chars) — likely obfuscated payload"),
+    (r"['\"][0-9a-fA-F]{200,}['\"]",
+     "high", "large hex-encoded string (>200 chars) — likely obfuscated payload"),
+    (r"eval\s*\(\s*Buffer\.from\s*\(",
+     "high", "eval(Buffer.from(...)) — obfuscated execution"),
+    (r"exec\s*\(\s*(?:compile|bytes\.fromhex|codecs\.decode)",
+     "high", "exec(compile/fromhex/decode(...)) — obfuscated Python execution"),
+
+    # Reverse shells and C2 callbacks
+    (r"(?:net\.Socket|dgram\.createSocket|new\s+WebSocket)\s*\(.{0,60}\d{1,3}\.\d{1,3}\.",
+     "high", "network socket opened to hardcoded IP address"),
+    (r"socket\.(?:connect|create_connection)\s*\(\s*\(.{0,40}\d{1,3}\.\d{1,3}\.",
+     "high", "Python socket to hardcoded IP"),
+    (r"/bin/(?:ba)?sh.{0,20}-[ic]\b",
+     "high", "shell invocation with -i/-c (reverse shell pattern)"),
+
+    # Credential file access — reading SSH keys, AWS creds, etc.
+    (r"\.ssh[/\\](?:id_rsa|id_ed25519|id_ecdsa|known_hosts|authorized_keys)",
+     "high", "accesses SSH key files"),
+    (r"\.aws[/\\]credentials|\.aws[/\\]config",
+     "high", "accesses AWS credential files"),
+    (r"\.npmrc\b",
+     "warn", "accesses .npmrc (may contain auth tokens)"),
+    (r"\.pypirc\b",
+     "warn", "accesses .pypirc (may contain auth tokens)"),
+    (r"\.docker[/\\]config\.json",
+     "warn", "accesses Docker config (may contain registry auth)"),
+    (r"\.kube[/\\]config",
+     "warn", "accesses kubeconfig"),
+    (r"\.gnupg[/\\]",
+     "warn", "accesses GPG keyring"),
+
+    # Crypto mining
+    (r"stratum\+tcp://",
+     "high", "stratum mining pool connection"),
+    (r"(?:xmr|monero|coinhive|cryptonight)",
+     "warn", "possible cryptominer reference"),
+
+    # Exfil channels
+    (r"discord(?:app)?\.com/api/webhooks/\d+/",
+     "high", "Discord webhook URL (exfiltration channel)"),
+    (r"api\.telegram\.org/bot[A-Za-z0-9:_-]+/send",
+     "high", "Telegram bot API call (exfiltration channel)"),
+
+    # DNS exfiltration
+    (r"dns\.resolve.*TXT\b|TXT.*dns\.resolve",
+     "warn", "DNS TXT resolution (possible DNS exfil)"),
+
+    # Persistence mechanisms
+    (r"(?:HKEY_CURRENT_USER|HKCU|HKLM).{0,40}\\Run\b",
+     "high", "Windows registry Run key (persistence mechanism)"),
+    (r"crontab\s+-|/etc/cron",
+     "high", "crontab modification (persistence mechanism)"),
+    (r"\.bashrc|\.bash_profile|\.profile|\.zshrc",
+     "warn", "modifies shell profile (possible persistence)"),
+    (r"LaunchAgents|LaunchDaemons",
+     "high", "macOS LaunchAgent/Daemon (persistence mechanism)"),
+    (r"(?:systemd|systemctl).{0,30}enable",
+     "high", "systemd service installation (persistence)"),
+
+    # Suspicious network calls with hardcoded IPs
+    (r"https?://\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}[:/]",
+     "warn", "HTTP request to raw IP address"),
+]
+
+
+def _get_tarball_url(pkg, pm, meta):
+    """Return (url, format) for the package tarball, or (None, None)."""
+    if pm in ("npm", "yarn", "pnpm"):
+        # npm registry includes the tarball URL in the version metadata
+        ver = meta.get("version", "")
+        if not ver:
+            return None, None
+        data = _get(f"https://registry.npmjs.org/{urllib.parse.quote(pkg, safe='@%')}/{ver}")
+        if data and data.get("dist", {}).get("tarball"):
+            return data["dist"]["tarball"], "tgz"
+        return None, None
+
+    elif pm in ("pip", "pip3", "uv"):
+        data = _get(f"https://pypi.org/pypi/{urllib.parse.quote(pkg, safe='')}/json")
+        if not data:
+            return None, None
+        # Prefer sdist (tar.gz) over wheel — wheels are zips with less source to scan
+        for finfo in data.get("urls", []):
+            if finfo.get("packagetype") == "sdist":
+                return finfo["url"], "tgz"
+        # Fall back to first wheel
+        for finfo in data.get("urls", []):
+            if finfo.get("filename", "").endswith(".whl"):
+                return finfo["url"], "whl"
+        return None, None
+
+    return None, None
+
+
+def _is_scannable(filename):
+    """Should we scan this file for suspicious patterns?"""
+    # Only scan text-ish source files, not images/binaries/minified bundles
+    exts = {
+        ".js", ".mjs", ".cjs", ".ts", ".jsx", ".tsx",
+        ".py", ".pyw",
+        ".sh", ".bash", ".zsh", ".fish", ".bat", ".cmd", ".ps1",
+        ".rb", ".rs", ".go", ".php", ".pl", ".lua",
+        ".json", ".yaml", ".yml", ".toml", ".cfg", ".ini",
+    }
+    _, ext = os.path.splitext(filename.lower())
+    if ext in exts:
+        return True
+    # Also scan files with no extension (often shell scripts)
+    if not ext and not filename.startswith("."):
+        return True
+    return False
+
+
+def _scan_source(pkg, pm, meta):
+    """
+    Download package tarball, extract, scan source files for malicious patterns.
+    Returns list of (severity, message) tuples.
+    """
+    url, fmt = _get_tarball_url(pkg, pm, meta)
+    if not url:
+        return []
+
+    tmpdir = tempfile.mkdtemp(prefix="si_scan_")
+    try:
+        # Download
+        archive_path = os.path.join(tmpdir, f"pkg.{fmt}")
+        try:
+            urllib.request.urlretrieve(url, archive_path)
+        except Exception:
+            return [("info", "could not download package for source scan")]
+
+        # Size gate — skip anything over 10MB to keep scans fast
+        if os.path.getsize(archive_path) > 10 * 1024 * 1024:
+            return [("info", "package >10MB, skipping source scan")]
+
+        # Extract
+        src_dir = os.path.join(tmpdir, "src")
+        os.makedirs(src_dir, exist_ok=True)
+        try:
+            if fmt == "whl":
+                with zipfile.ZipFile(archive_path) as zf:
+                    zf.extractall(src_dir)
+            else:
+                with tarfile.open(archive_path, "r:*") as tf:
+                    tf.extractall(src_dir, filter="data")
+        except Exception:
+            try:
+                # Older Python without tarfile filter param
+                with tarfile.open(archive_path, "r:*") as tf:
+                    tf.extractall(src_dir)
+            except Exception:
+                return [("info", "could not extract package for source scan")]
+
+        # Scan
+        findings = []
+        seen_messages = set()
+        files_scanned = 0
+        for root, dirs, files in os.walk(src_dir):
+            # Skip node_modules and __pycache__ if somehow present
+            dirs[:] = [d for d in dirs if d not in ("node_modules", "__pycache__", ".git")]
+            for fname in files:
+                if not _is_scannable(fname):
+                    continue
+                fpath = os.path.join(root, fname)
+                try:
+                    with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                        content = f.read(50_000)  # first 50KB per file
+                except Exception:
+                    continue
+                files_scanned += 1
+                for pattern, sev, desc in _SOURCE_SCAN_PATTERNS:
+                    if re.search(pattern, content, re.IGNORECASE):
+                        # Deduplicate: only report each pattern type once
+                        if desc not in seen_messages:
+                            seen_messages.add(desc)
+                            rel = os.path.relpath(fpath, src_dir)
+                            findings.append((sev, f"{desc}  [{rel}]"))
+                            if len(findings) >= 15:
+                                return findings  # cap output
+        return findings
+
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# GitHub repo verification (starjacking / link fraud detection)
+#
+# If the registry metadata links to a GitHub repo, check that:
+# 1. The repo actually exists
+# 2. It was not recently transferred or is archived
+# 3. The description/topics somewhat relate to the package
+# This catches starjacking where an attacker sets their malicious
+# package's repo URL to point at a popular unrelated project.
+# ---------------------------------------------------------------------------
+
+def _check_github_repo(pkg, meta, pm):
+    """Returns list of (severity, message) tuples."""
+    issues = []
+
+    # Extract GitHub URL from registry metadata
+    repo_url = ""
+    if pm in ("npm", "yarn", "pnpm"):
+        # npm meta already loaded; re-fetch to get repository field
+        data = _get(f"https://registry.npmjs.org/{urllib.parse.quote(pkg, safe='@%')}")
+        if data:
+            repo = data.get("repository", {})
+            if isinstance(repo, dict):
+                repo_url = repo.get("url", "")
+            elif isinstance(repo, str):
+                repo_url = repo
+    elif pm in ("pip", "pip3", "uv"):
+        repo_url = meta.get("home_page", "")
+
+    if not repo_url:
+        return []
+
+    # Extract owner/repo from the URL
+    m = re.search(r"github\.com[/:]([^/]+)/([^/.#]+)", repo_url)
+    if not m:
+        return []
+    owner, repo = m.group(1), m.group(2)
+
+    gh_data = _get(f"https://api.github.com/repos/{owner}/{repo}")
+    if gh_data is None:
+        issues.append(("warn", f"linked GitHub repo {owner}/{repo} does not exist or is private"))
+        return issues
+
+    if gh_data.get("archived"):
+        issues.append(("warn", f"linked GitHub repo {owner}/{repo} is archived"))
+
+    # Starjacking detection: if the repo name doesn't resemble the package name
+    # at all, it might be pointing at someone else's popular repo.
+    repo_name = gh_data.get("name", "").lower()
+    repo_desc = (gh_data.get("description") or "").lower()
+    pkg_lower = pkg.lower().replace("-", "").replace("_", "")
+    repo_clean = repo_name.replace("-", "").replace("_", "")
+
+    # Generous match: package name substring of repo name, or vice versa
+    name_related = (
+        pkg_lower in repo_clean
+        or repo_clean in pkg_lower
+        or pkg_lower in repo_desc
+    )
+    if not name_related and gh_data.get("stargazers_count", 0) > 500:
+        # The package links to a popular repo that doesn't seem related.
+        # This is the classic starjacking pattern.
+        stars = gh_data["stargazers_count"]
+        issues.append((
+            "high",
+            f"possible starjacking — links to {owner}/{repo} ({stars} stars) "
+            f"but repo name doesn't match package name"
+        ))
+
+    return issues
+
+
+# ---------------------------------------------------------------------------
+# Version anomaly detection
+# ---------------------------------------------------------------------------
+
+def _check_version_anomaly(pkg, pm, meta):
+    """Flag suspicious version patterns."""
+    issues = []
+    ver = meta.get("version", "")
+    if not ver:
+        return issues
+
+    # Check if only one version has ever been published
+    # (We can infer this cheaply from npm's time field or PyPI's releases)
+    if pm in ("npm", "yarn", "pnpm"):
+        data = _get(f"https://registry.npmjs.org/{urllib.parse.quote(pkg, safe='@%')}")
+        if data and "time" in data:
+            # "time" has "created", "modified", and one entry per version
+            version_count = len(data["time"]) - 2  # subtract created+modified
+            if version_count == 1:
+                issues.append(("warn", "only 1 version ever published"))
+            elif version_count <= 0:
+                issues.append(("warn", "no version history found"))
+    elif pm in ("pip", "pip3", "uv"):
+        data = _get(f"https://pypi.org/pypi/{urllib.parse.quote(pkg, safe='')}/json")
+        if data and "releases" in data:
+            non_empty = sum(1 for v, files in data["releases"].items() if files)
+            if non_empty == 1:
+                issues.append(("warn", "only 1 release ever published"))
+
+    # Suspicious version number: starts very high (attacker trying to win
+    # "latest" in dependency confusion), or 0.0.x (throwaway test)
+    try:
+        major = int(ver.split(".")[0])
+        if major >= 99:
+            issues.append(("high",
+                f"version {ver} — extremely high major version (dependency confusion pattern)"))
+    except (ValueError, IndexError):
+        pass
+
+    return issues
+
+
+# ---------------------------------------------------------------------------
+# Whitelist support
+#
+# If a whitelist file is active, packages not on it are hard-blocked.
+# File format: one package name per line, # comments, blank lines ignored.
+# The file path can be passed with --whitelist or set via SI_WHITELIST env.
+# Default location: ~/.config/safe-install/whitelist.txt
+# ---------------------------------------------------------------------------
+
+def _load_whitelist(path=None):
+    """Returns a set of lowercased package names, or None if no whitelist."""
+    if path is None:
+        path = os.environ.get("SI_WHITELIST")
+    if path is None:
+        default = os.path.join(
+            os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
+            "safe-install", "whitelist.txt"
+        )
+        if os.path.isfile(default):
+            path = default
+    if path is None:
+        return None
+    try:
+        names = set()
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    names.add(line.lower())
+        return names
+    except OSError as e:
+        print(f"{Y}[!] Cannot read whitelist {path}: {e}{RST}", file=sys.stderr)
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Main scan function
 # ---------------------------------------------------------------------------
 
-def scan_package(pkg_spec, pm, auto_yes):
+def scan_package(pkg_spec, pm, auto_yes, do_source_scan=True, whitelist=None):
     """
     Scan a single package spec.
     Returns True if installation should proceed, False to abort.
@@ -531,6 +965,11 @@ def scan_package(pkg_spec, pm, auto_yes):
 
     print(f"\n{C}{B}[ {pkg} ]{RST}  ({pm})")
 
+    # --- 0. Whitelist check (instant, before anything else) ---
+    if whitelist is not None and pkg.lower() not in whitelist:
+        print(f"  {R}[BLOCKED]{RST}  not on whitelist")
+        return False
+
     issues = []     # list of (level, message)  — "high", "warn", "info"
     meta = {}
 
@@ -540,16 +979,20 @@ def scan_package(pkg_spec, pm, auto_yes):
         note, sev = bad
         issues.append(("high", f"KNOWN BAD PACKAGE: {note}"))
 
-    # --- 2. Typosquatting ---
+    # --- 2. Typosquatting (Levenshtein) ---
     typos = _typosquatting_candidates(pkg, pm)
     if typos:
         issues.append(("high", f"Possible typosquat of: {', '.join(typos)}"))
 
-    # --- 3. Namespace squatting ---
+    # --- 3. Homoglyph / Unicode confusable detection ---
+    for msg in _check_homoglyphs(pkg, pm):
+        issues.append(("high", msg))
+
+    # --- 4. Namespace squatting ---
     for w in _check_namespace(pkg, pm):
         issues.append(("warn", w))
 
-    # --- 4. OSV vulnerability check ---
+    # --- 5. OSV vulnerability check ---
     print(f"  {D}checking OSV...{RST}", end="", flush=True)
     vulns = _osv_vulns(pkg, pm)
     print(f"\r  OSV: ", end="")
@@ -578,7 +1021,7 @@ def scan_package(pkg_spec, pm, auto_yes):
     else:
         print(f"{G}clean{RST}        ")
 
-    # --- 5. Registry metadata ---
+    # --- 6. Registry metadata ---
     print(f"  {D}checking registry...{RST}", end="", flush=True)
 
     if pm in ("npm", "yarn", "pnpm"):
@@ -635,6 +1078,31 @@ def scan_package(pkg_spec, pm, auto_yes):
     else:
         # found is None = check failed or not supported
         print(f"{D}check failed{RST}        ")
+
+    # --- 7. GitHub repo verification (starjacking) ---
+    if meta.get("found") and pm in ("npm","yarn","pnpm","pip","pip3","uv"):
+        print(f"  {D}checking GitHub repo...{RST}", end="", flush=True)
+        gh_issues = _check_github_repo(pkg, meta, pm)
+        for sev, msg in gh_issues:
+            issues.append((sev, msg))
+        print(f"\r  GitHub: {R + str(len(gh_issues)) + ' issue(s)' + RST if gh_issues else G + 'OK' + RST}        ")
+
+    # --- 8. Version anomaly ---
+    if meta.get("found"):
+        ver_issues = _check_version_anomaly(pkg, pm, meta)
+        for sev, msg in ver_issues:
+            issues.append((sev, msg))
+
+    # --- 9. Source code scan ---
+    if do_source_scan and meta.get("found") and pm in ("npm","yarn","pnpm","pip","pip3","uv"):
+        print(f"  {D}scanning source code...{RST}", end="", flush=True)
+        src_issues = _scan_source(pkg, pm, meta)
+        if src_issues:
+            print(f"\r  source: {R}{len(src_issues)} finding(s){RST}        ")
+            for sev, msg in src_issues:
+                issues.append((sev, msg))
+        else:
+            print(f"\r  source: {G}clean{RST}        ")
 
     # --- Display results ---
     print()
@@ -843,9 +1311,30 @@ def main():
     auto_yes  = any(a in ("-y", "--yes") for a in argv)
     dry_run   = "--dry-run"   in argv
     no_check  = "--no-check"  in argv
+    no_scan   = "--no-scan"   in argv
     show_ver  = "--version"   in argv or "-V" in argv
 
-    argv = [a for a in argv if a not in ("-y","--yes","--dry-run","--no-check","--version","-V")]
+    # --whitelist <path>
+    wl_path = None
+    for i, a in enumerate(argv):
+        if a == "--whitelist" and i + 1 < len(argv):
+            wl_path = argv[i + 1]
+            break
+
+    strip_flags = {"-y","--yes","--dry-run","--no-check","--no-scan","--version","-V","--whitelist"}
+    new_argv = []
+    skip_next = False
+    for a in argv:
+        if skip_next:
+            skip_next = False; continue
+        if a == "--whitelist":
+            skip_next = True; continue
+        if a in strip_flags:
+            continue
+        new_argv.append(a)
+    argv = new_argv
+
+    whitelist = _load_whitelist(wl_path)
 
     if show_ver:
         print(f"safe-install {VERSION}")
@@ -916,7 +1405,7 @@ def main():
 
     aborted = []
     for pkg in packages:
-        ok = scan_package(pkg, pm, auto_yes)
+        ok = scan_package(pkg, pm, auto_yes, do_source_scan=not no_scan, whitelist=whitelist)
         if not ok:
             aborted.append(pkg)
 
