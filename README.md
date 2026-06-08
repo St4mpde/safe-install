@@ -40,19 +40,21 @@ $ safe-install npm install react-dom lodash
 No dependencies — just Python 3.8+ and the standard library.
 
 ```bash
-# clone and alias
-git clone https://github.com/sh1gure897/safe-install.git
-alias si='python3 /path/to/safe-install/safe_install.py'
+pip install git+https://github.com/St4mpde/safe-install.git
 ```
 
-**PowerShell:**
-```powershell
-function si { python "$HOME\safe-install\safe_install.py" @args }
+That's it.  Now you have `si` and `safe-install` commands globally.
+
+**Or with [pipx](https://pipx.pypa.io/) (isolated install):**
+```bash
+pipx install git+https://github.com/St4mpde/safe-install.git
 ```
 
-**Windows CMD:**
-```
-doskey si=python C:\path\to\safe_install.py $*
+**Or just clone and run directly:**
+```bash
+git clone https://github.com/St4mpde/safe-install.git
+cd safe-install
+pip install .
 ```
 
 ## Usage

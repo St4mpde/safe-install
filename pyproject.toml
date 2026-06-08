@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "safe-install"
+version = "1.0.0"
+description = "Pre-flight security check for package managers"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.8"
+authors = [{name = "sh1gure897"}]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Topic :: Security",
+    "Topic :: Software Development :: Build Tools",
+    "Programming Language :: Python :: 3",
+]
+
+[project.scripts]
+si = "safe_install:main"
+safe-install = "safe_install:main"
+
+[project.urls]
+Repository = "https://github.com/St4mpde/safe-install"
+
+[tool.setuptools]
+py-modules = ["safe_install"]
