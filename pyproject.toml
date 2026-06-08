@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "safe-install"
-version = "2.0.0"
+version = "2.1.0"
 description = "Pre-flight security check for package managers"
 readme = "README.md"
 license = "MIT"

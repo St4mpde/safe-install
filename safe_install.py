@@ -35,7 +35,7 @@ import zipfile
 import shutil
 from datetime import datetime, timezone
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 
 # Fix Windows console encoding — without this any non-ASCII in package
 # descriptions will throw UnicodeEncodeError on cp932/cp1252 terminals
@@ -55,7 +55,15 @@ if _use_color:
 else:
     R = Y = G = C = B = D = RST = ""
 
-_API_TIMEOUT = int(os.environ.get("SI_TIMEOUT", "12"))
+try:
+    _API_TIMEOUT = int(os.environ.get("SI_TIMEOUT", "12"))
+except ValueError:
+    _API_TIMEOUT = 12
+
+# Per-session registry data cache.  Avoids hitting the same registry
+# endpoint 3-4x for the same package (meta, version check, github check,
+# source tarball URL all need the same data).
+_registry_cache = {}
 
 
 # ---------------------------------------------------------------------------
@@ -237,6 +245,16 @@ def _get(url, timeout=None):
         return None
 
 
+def _get_cached(url, timeout=None):
+    """GET with per-session cache — use for registry endpoints that get
+    hit multiple times for the same package."""
+    if url in _registry_cache:
+        return _registry_cache[url]
+    result = _get(url, timeout)
+    _registry_cache[url] = result  # cache None too to avoid retrying dead endpoints
+    return result
+
+
 def _post(url, payload, timeout=None):
     if timeout is None:
         timeout = _API_TIMEOUT
@@ -259,7 +277,7 @@ def _post(url, payload, timeout=None):
 # ---------------------------------------------------------------------------
 
 def _npm_meta(pkg):
-    data = _get(f"https://registry.npmjs.org/{urllib.parse.quote(pkg, safe='@%')}")
+    data = _get_cached(f"https://registry.npmjs.org/{urllib.parse.quote(pkg, safe='@%')}")
     if data is None:
         return {"found": False}
     latest = data.get("dist-tags", {}).get("latest", "")
@@ -285,7 +303,7 @@ def _npm_downloads(pkg):
 
 
 def _pypi_meta(pkg):
-    data = _get(f"https://pypi.org/pypi/{urllib.parse.quote(pkg, safe='')}/json")
+    data = _get_cached(f"https://pypi.org/pypi/{urllib.parse.quote(pkg, safe='')}/json")
     if data is None:
         return {"found": False}
     info = data.get("info", {})
@@ -376,8 +394,7 @@ def _go_meta(pkg):
     quoted = urllib.parse.quote(mod_path, safe="/")
     data = _get(f"https://proxy.golang.org/{quoted}/@latest")
     if data is None:
-        # 404 means module not found or not cached
-        return {"found": None, "description": ""}
+        return {"found": False, "description": ""}
     return {
         "found":   True,
         "version": data.get("Version", ""),
@@ -485,9 +502,10 @@ def _days_old(date_str):
     if not date_str:
         return -1
     try:
-        d = datetime.fromisoformat(date_str[:10])
-        return (datetime.now() - d).days
-    except Exception:
+        # Parse as naive date (YYYY-MM-DD) and compare against today
+        d = datetime.strptime(date_str[:10], "%Y-%m-%d")
+        return (datetime.utcnow() - d).days
+    except (ValueError, TypeError):
         return -1
 
 
@@ -693,7 +711,7 @@ def _get_tarball_url(pkg, pm, meta):
         return None, None
 
     elif pm in ("pip", "pip3", "uv"):
-        data = _get(f"https://pypi.org/pypi/{urllib.parse.quote(pkg, safe='')}/json")
+        data = _get_cached(f"https://pypi.org/pypi/{urllib.parse.quote(pkg, safe='')}/json")
         if not data:
             return None, None
         # Prefer sdist (tar.gz) over wheel — wheels are zips with less source to scan
@@ -728,6 +746,42 @@ def _is_scannable(filename):
     return False
 
 
+_TRUSTED_TARBALL_HOSTS = {
+    "registry.npmjs.org",
+    "registry.yarnpkg.com",
+    "files.pythonhosted.org",
+    "pypi.org",
+    "crates.io",
+    "static.crates.io",
+    "rubygems.org",
+}
+
+
+def _safe_extract_zip(archive_path, dest):
+    """Extract zip/whl with path traversal protection (zip slip)."""
+    dest_real = os.path.realpath(dest)
+    with zipfile.ZipFile(archive_path) as zf:
+        for info in zf.infolist():
+            target = os.path.realpath(os.path.join(dest, info.filename))
+            if not target.startswith(dest_real + os.sep) and target != dest_real:
+                continue  # silently skip path traversal entries
+            zf.extract(info, dest)
+
+
+def _safe_extract_tar(archive_path, dest):
+    """Extract tar.gz/tgz with path traversal + symlink protection."""
+    dest_real = os.path.realpath(dest)
+    with tarfile.open(archive_path, "r:*") as tf:
+        for member in tf.getmembers():
+            # Block symlinks — they can point outside the extraction dir
+            if member.issym() or member.islnk():
+                continue
+            target = os.path.realpath(os.path.join(dest, member.name))
+            if not target.startswith(dest_real + os.sep) and target != dest_real:
+                continue  # path traversal attempt
+            tf.extract(member, dest)
+
+
 def _scan_source(pkg, pm, meta):
     """
     Download package tarball, extract, scan source files for malicious patterns.
@@ -736,6 +790,14 @@ def _scan_source(pkg, pm, meta):
     url, fmt = _get_tarball_url(pkg, pm, meta)
     if not url:
         return []
+
+    # Validate tarball URL domain to prevent SSRF via compromised registry data
+    try:
+        host = urllib.parse.urlparse(url).hostname or ""
+        if host not in _TRUSTED_TARBALL_HOSTS:
+            return [("warn", f"tarball URL points to untrusted host: {host}")]
+    except Exception:
+        return [("warn", "could not parse tarball URL")]
 
     tmpdir = tempfile.mkdtemp(prefix="si_scan_")
     try:
@@ -750,23 +812,16 @@ def _scan_source(pkg, pm, meta):
         if os.path.getsize(archive_path) > 10 * 1024 * 1024:
             return [("info", "package >10MB, skipping source scan")]
 
-        # Extract
+        # Extract with path traversal protection
         src_dir = os.path.join(tmpdir, "src")
         os.makedirs(src_dir, exist_ok=True)
         try:
             if fmt == "whl":
-                with zipfile.ZipFile(archive_path) as zf:
-                    zf.extractall(src_dir)
+                _safe_extract_zip(archive_path, src_dir)
             else:
-                with tarfile.open(archive_path, "r:*") as tf:
-                    tf.extractall(src_dir, filter="data")
+                _safe_extract_tar(archive_path, src_dir)
         except Exception:
-            try:
-                # Older Python without tarfile filter param
-                with tarfile.open(archive_path, "r:*") as tf:
-                    tf.extractall(src_dir)
-            except Exception:
-                return [("info", "could not extract package for source scan")]
+            return [("info", "could not extract package for source scan")]
 
         # Scan
         findings = []
@@ -818,8 +873,7 @@ def _check_github_repo(pkg, meta, pm):
     # Extract GitHub URL from registry metadata
     repo_url = ""
     if pm in ("npm", "yarn", "pnpm"):
-        # npm meta already loaded; re-fetch to get repository field
-        data = _get(f"https://registry.npmjs.org/{urllib.parse.quote(pkg, safe='@%')}")
+        data = _get_cached(f"https://registry.npmjs.org/{urllib.parse.quote(pkg, safe='@%')}")
         if data:
             repo = data.get("repository", {})
             if isinstance(repo, dict):
@@ -886,7 +940,7 @@ def _check_version_anomaly(pkg, pm, meta):
     # Check if only one version has ever been published
     # (We can infer this cheaply from npm's time field or PyPI's releases)
     if pm in ("npm", "yarn", "pnpm"):
-        data = _get(f"https://registry.npmjs.org/{urllib.parse.quote(pkg, safe='@%')}")
+        data = _get_cached(f"https://registry.npmjs.org/{urllib.parse.quote(pkg, safe='@%')}")
         if data and "time" in data:
             # "time" has "created", "modified", and one entry per version
             version_count = len(data["time"]) - 2  # subtract created+modified
@@ -895,7 +949,7 @@ def _check_version_anomaly(pkg, pm, meta):
             elif version_count <= 0:
                 issues.append(("warn", "no version history found"))
     elif pm in ("pip", "pip3", "uv"):
-        data = _get(f"https://pypi.org/pypi/{urllib.parse.quote(pkg, safe='')}/json")
+        data = _get_cached(f"https://pypi.org/pypi/{urllib.parse.quote(pkg, safe='')}/json")
         if data and "releases" in data:
             non_empty = sum(1 for v, files in data["releases"].items() if files)
             if non_empty == 1:
@@ -1301,6 +1355,24 @@ _ECOSYSTEMS = {
 
 
 # ---------------------------------------------------------------------------
+# Safe subprocess execution — avoids shell=True to prevent command injection
+# when package names come from untrusted sources (lockfiles, CI vars, etc.)
+# ---------------------------------------------------------------------------
+
+def _run_cmd(cmd_list):
+    """Run a package manager command safely.  On Windows, .cmd/.bat wrappers
+    (npm.cmd, pip.cmd, etc.) need shell=True to run under cmd.exe, but
+    using shell=True with user-controlled arguments is a command injection
+    risk.  We resolve the executable via shutil.which() and call it directly."""
+    exe = shutil.which(cmd_list[0])
+    if exe is None:
+        # Fall back to shell=True if we can't find the executable
+        # (better than crashing — the tool is still useful)
+        return subprocess.run(cmd_list, shell=True)
+    return subprocess.run([exe] + cmd_list[1:])
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -1347,11 +1419,9 @@ def main():
     pm   = argv[0].lower()
     rest = argv[1:]
 
-    _shell = sys.platform == "win32"
-
     if pm not in _ECOSYSTEMS:
         # Not an ecosystem we know — pass through unchanged
-        subprocess.run([pm] + rest, shell=_shell)
+        _run_cmd([pm] + rest)
         return
 
     install_cmds, extract_fn = _ECOSYSTEMS[pm]
@@ -1364,13 +1434,13 @@ def main():
     # dotnet is special: "dotnet add package <name>"
     if pm == "dotnet":
         if subcmd != "add" or len(rest) < 2:
-            subprocess.run(["dotnet"] + rest, shell=_shell)
+            _run_cmd(["dotnet"] + rest)
             return
         # Skip the word "package" if present
         pkg_args = rest[2:] if rest[1].lower() == "package" else rest[1:]
         original_cmd = ["dotnet"] + rest
     elif subcmd not in install_cmds:
-        subprocess.run([pm] + rest, shell=_shell)
+        _run_cmd([pm] + rest)
         return
     else:
         pkg_args = rest[1:]
@@ -1378,7 +1448,7 @@ def main():
 
     if no_check:
         print(f"{D}[safe-install] --no-check: skipping all checks{RST}")
-        subprocess.run(original_cmd, shell=_shell)
+        _run_cmd(original_cmd)
         return
 
     # Collect packages
@@ -1398,7 +1468,7 @@ def main():
 
     if not packages:
         print(f"{D}[safe-install] No packages to check — running directly{RST}")
-        subprocess.run(original_cmd, shell=_shell)
+        _run_cmd(original_cmd)
         return
 
     print(f"\n{B}[safe-install] Scanning {len(packages)} package(s) — {pm}{RST}")
@@ -1422,7 +1492,7 @@ def main():
 
     print(f"{G}{B}All checks passed.{RST} Running:")
     print(f"  {D}{' '.join(original_cmd)}{RST}\n")
-    result = subprocess.run(original_cmd, shell=_shell)
+    result = _run_cmd(original_cmd)
     sys.exit(result.returncode)
 
 
