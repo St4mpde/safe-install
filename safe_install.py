@@ -33,9 +33,11 @@ import tempfile
 import tarfile
 import zipfile
 import shutil
+import hashlib
+import base64
 from datetime import datetime, timezone
 
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 
 # Fix Windows console encoding — without this any non-ASCII in package
 # descriptions will throw UnicodeEncodeError on cp932/cp1252 terminals
@@ -227,6 +229,9 @@ _BAD_SCRIPT_PATTERNS = [
 # HTTP helper
 # ---------------------------------------------------------------------------
 
+_MAX_RESPONSE = 20 * 1024 * 1024  # 20MB — sane limit for registry JSON
+
+
 def _get(url, timeout=None):
     """Simple GET, returns parsed JSON or None on any error."""
     if timeout is None:
@@ -236,10 +241,11 @@ def _get(url, timeout=None):
             url, headers={"Accept": "application/json", "User-Agent": f"safe-install/{VERSION}"}
         )
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read())
-    except urllib.error.HTTPError as e:
-        if e.code == 404:
-            return None
+            data = r.read(_MAX_RESPONSE + 1)
+            if len(data) > _MAX_RESPONSE:
+                return None  # response too large, likely not a real registry
+            return json.loads(data)
+    except urllib.error.HTTPError:
         return None
     except Exception:
         return None
@@ -266,7 +272,10 @@ def _post(url, payload, timeout=None):
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read())
+            body = r.read(_MAX_RESPONSE + 1)
+            if len(body) > _MAX_RESPONSE:
+                return None
+            return json.loads(body)
     except Exception:
         return None
 
@@ -504,7 +513,7 @@ def _days_old(date_str):
     try:
         # Parse as naive date (YYYY-MM-DD) and compare against today
         d = datetime.strptime(date_str[:10], "%Y-%m-%d")
-        return (datetime.utcnow() - d).days
+        return (datetime.now(timezone.utc).replace(tzinfo=None) - d).days
     except (ValueError, TypeError):
         return -1
 
@@ -699,32 +708,46 @@ _SOURCE_SCAN_PATTERNS = [
 
 
 def _get_tarball_url(pkg, pm, meta):
-    """Return (url, format) for the package tarball, or (None, None)."""
+    """Return (url, format, expected_hash) for the package tarball.
+    expected_hash is ("sha256", hex_digest) or None."""
     if pm in ("npm", "yarn", "pnpm"):
-        # npm registry includes the tarball URL in the version metadata
         ver = meta.get("version", "")
         if not ver:
-            return None, None
+            return None, None, None
         data = _get(f"https://registry.npmjs.org/{urllib.parse.quote(pkg, safe='@%')}/{ver}")
         if data and data.get("dist", {}).get("tarball"):
-            return data["dist"]["tarball"], "tgz"
-        return None, None
+            dist = data["dist"]
+            # npm provides integrity as SRI (sha512-...) and shasum (sha1 hex)
+            expected = None
+            integrity = dist.get("integrity", "")
+            if integrity.startswith("sha512-"):
+                try:
+                    digest = base64.b64decode(integrity[7:]).hex()
+                    expected = ("sha512", digest)
+                except Exception:
+                    pass
+            if not expected and dist.get("shasum"):
+                expected = ("sha1", dist["shasum"])
+            return dist["tarball"], "tgz", expected
+        return None, None, None
 
     elif pm in ("pip", "pip3", "uv"):
         data = _get_cached(f"https://pypi.org/pypi/{urllib.parse.quote(pkg, safe='')}/json")
         if not data:
-            return None, None
-        # Prefer sdist (tar.gz) over wheel — wheels are zips with less source to scan
+            return None, None, None
         for finfo in data.get("urls", []):
             if finfo.get("packagetype") == "sdist":
-                return finfo["url"], "tgz"
-        # Fall back to first wheel
+                sha = (finfo.get("digests") or {}).get("sha256")
+                expected = ("sha256", sha) if sha else None
+                return finfo["url"], "tgz", expected
         for finfo in data.get("urls", []):
             if finfo.get("filename", "").endswith(".whl"):
-                return finfo["url"], "whl"
-        return None, None
+                sha = (finfo.get("digests") or {}).get("sha256")
+                expected = ("sha256", sha) if sha else None
+                return finfo["url"], "whl", expected
+        return None, None, None
 
-    return None, None
+    return None, None, None
 
 
 def _is_scannable(filename):
@@ -771,6 +794,9 @@ def _safe_extract_zip(archive_path, dest):
 def _safe_extract_tar(archive_path, dest):
     """Extract tar.gz/tgz with path traversal + symlink protection."""
     dest_real = os.path.realpath(dest)
+    # Python 3.12+ added filter param; use it when available to suppress
+    # deprecation warning, but still do our own validation.
+    _has_filter = sys.version_info >= (3, 12)
     with tarfile.open(archive_path, "r:*") as tf:
         for member in tf.getmembers():
             # Block symlinks — they can point outside the extraction dir
@@ -779,7 +805,51 @@ def _safe_extract_tar(archive_path, dest):
             target = os.path.realpath(os.path.join(dest, member.name))
             if not target.startswith(dest_real + os.sep) and target != dest_real:
                 continue  # path traversal attempt
-            tf.extract(member, dest)
+            if _has_filter:
+                tf.extract(member, dest, filter="fully_trusted")
+            else:
+                tf.extract(member, dest)
+
+
+# Suspicious patterns specifically in setup.py / setup.cfg — code here runs
+# during `pip install`, so network access or shell commands are a huge red flag.
+_SETUP_PY_PATTERNS = [
+    (r"os\.system\s*\(",       "high", "os.system() in setup.py — executes during install"),
+    (r"subprocess\.\w+\s*\(",  "high", "subprocess call in setup.py — executes during install"),
+    (r"urllib|urlopen|requests?\.\w+\(|httpx\.",
+                               "high", "network access in setup.py — executes during install"),
+    (r"\bexec\s*\(",           "high", "exec() in setup.py — dynamic code execution during install"),
+    (r"\beval\s*\(",           "high", "eval() in setup.py — dynamic code execution during install"),
+    (r"__import__\s*\(",       "high", "dynamic __import__ in setup.py — executes during install"),
+    (r"ctypes\.CDLL|ctypes\.cdll",
+                               "warn", "ctypes in setup.py — loads native code during install"),
+]
+
+# Binary files embedded in source packages — legitimate for some packages
+# (e.g. prebuilt wheels ship .so/.dll), but in an sdist/tarball it's suspicious.
+_BINARY_EXTS = {
+    ".exe", ".dll", ".so", ".dylib", ".bin", ".com", ".scr",
+    ".msi", ".deb", ".rpm", ".app", ".elf",
+}
+
+
+def _verify_integrity(archive_path, expected_hash):
+    """Verify downloaded archive against registry-provided hash.
+    expected_hash: (algo, hex_digest) or None.  Returns (ok, message)."""
+    if expected_hash is None:
+        return True, ""
+    algo, expected = expected_hash
+    try:
+        h = hashlib.new(algo)
+        with open(archive_path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        actual = h.hexdigest()
+        if actual != expected:
+            return False, f"{algo} mismatch: expected {expected[:16]}... got {actual[:16]}..."
+        return True, ""
+    except (ValueError, OSError):
+        return True, ""  # can't verify — don't block
 
 
 def _scan_source(pkg, pm, meta):
@@ -787,13 +857,16 @@ def _scan_source(pkg, pm, meta):
     Download package tarball, extract, scan source files for malicious patterns.
     Returns list of (severity, message) tuples.
     """
-    url, fmt = _get_tarball_url(pkg, pm, meta)
+    url, fmt, expected_hash = _get_tarball_url(pkg, pm, meta)
     if not url:
         return []
 
-    # Validate tarball URL domain to prevent SSRF via compromised registry data
+    # Validate tarball URL: must be HTTPS and from a trusted host
     try:
-        host = urllib.parse.urlparse(url).hostname or ""
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme != "https":
+            return [("high", f"tarball URL uses {parsed.scheme}:// instead of https — possible MITM")]
+        host = parsed.hostname or ""
         if host not in _TRUSTED_TARBALL_HOSTS:
             return [("warn", f"tarball URL points to untrusted host: {host}")]
     except Exception:
@@ -801,12 +874,28 @@ def _scan_source(pkg, pm, meta):
 
     tmpdir = tempfile.mkdtemp(prefix="si_scan_")
     try:
-        # Download
+        # Download with timeout (urlretrieve has no timeout support)
         archive_path = os.path.join(tmpdir, f"pkg.{fmt}")
         try:
-            urllib.request.urlretrieve(url, archive_path)
+            req = urllib.request.Request(url, headers={"User-Agent": f"safe-install/{VERSION}"})
+            with urllib.request.urlopen(req, timeout=_API_TIMEOUT * 3) as resp:
+                with open(archive_path, "wb") as out:
+                    total = 0
+                    while True:
+                        chunk = resp.read(65536)
+                        if not chunk:
+                            break
+                        total += len(chunk)
+                        if total > 10 * 1024 * 1024:
+                            break  # size gate — handled below
+                        out.write(chunk)
         except Exception:
             return [("info", "could not download package for source scan")]
+
+        # --- Integrity verification ---
+        ok, msg = _verify_integrity(archive_path, expected_hash)
+        if not ok:
+            return [("high", f"INTEGRITY FAILURE: {msg} — possible tampering")]
 
         # Size gate — skip anything over 10MB to keep scans fast
         if os.path.getsize(archive_path) > 10 * 1024 * 1024:
@@ -828,9 +917,19 @@ def _scan_source(pkg, pm, meta):
         seen_messages = set()
         files_scanned = 0
         for root, dirs, files in os.walk(src_dir):
-            # Skip node_modules and __pycache__ if somehow present
             dirs[:] = [d for d in dirs if d not in ("node_modules", "__pycache__", ".git")]
             for fname in files:
+                # --- Binary detection ---
+                _, ext = os.path.splitext(fname.lower())
+                if ext in _BINARY_EXTS:
+                    rel = os.path.relpath(os.path.join(root, fname), src_dir)
+                    key = f"binary:{ext}"
+                    if key not in seen_messages:
+                        seen_messages.add(key)
+                        findings.append(("high",
+                            f"embedded binary ({ext}) found  [{rel}]"))
+                    continue
+
                 if not _is_scannable(fname):
                     continue
                 fpath = os.path.join(root, fname)
@@ -840,15 +939,26 @@ def _scan_source(pkg, pm, meta):
                 except Exception:
                     continue
                 files_scanned += 1
+
+                # --- setup.py-specific patterns (Python) ---
+                is_setup = fname.lower() in ("setup.py", "setup.cfg", "conftest.py")
+                if is_setup and pm in ("pip", "pip3", "uv"):
+                    for pattern, sev, desc in _SETUP_PY_PATTERNS:
+                        if re.search(pattern, content, re.IGNORECASE):
+                            if desc not in seen_messages:
+                                seen_messages.add(desc)
+                                rel = os.path.relpath(fpath, src_dir)
+                                findings.append((sev, f"{desc}  [{rel}]"))
+
+                # --- General source scan patterns ---
                 for pattern, sev, desc in _SOURCE_SCAN_PATTERNS:
                     if re.search(pattern, content, re.IGNORECASE):
-                        # Deduplicate: only report each pattern type once
                         if desc not in seen_messages:
                             seen_messages.add(desc)
                             rel = os.path.relpath(fpath, src_dir)
                             findings.append((sev, f"{desc}  [{rel}]"))
-                            if len(findings) >= 15:
-                                return findings  # cap output
+                            if len(findings) >= 20:
+                                return findings
         return findings
 
     finally:
@@ -966,6 +1076,140 @@ def _check_version_anomaly(pkg, pm, meta):
         pass
 
     return issues
+
+
+# ---------------------------------------------------------------------------
+# Deprecation check
+# ---------------------------------------------------------------------------
+
+def _check_deprecation(pkg, pm, meta):
+    """Flag deprecated or abandoned packages."""
+    if pm in ("npm", "yarn", "pnpm"):
+        data = _get_cached(f"https://registry.npmjs.org/{urllib.parse.quote(pkg, safe='@%')}")
+        if data:
+            latest = data.get("dist-tags", {}).get("latest", "")
+            ver_data = data.get("versions", {}).get(latest, {})
+            msg = ver_data.get("deprecated")
+            if msg:
+                return [("warn", f"DEPRECATED: {msg[:120]}")]
+    elif pm in ("pip", "pip3", "uv"):
+        for c in meta.get("classifiers", []):
+            if "7 - Inactive" in c:
+                return [("warn", "package marked as Inactive by author")]
+    return []
+
+
+# ---------------------------------------------------------------------------
+# Maintainer change detection
+#
+# Classic takeover pattern: attacker gains access to a maintainer's npm
+# account and publishes a new version.  The new version's _npmUser field
+# will differ from all previous versions.
+# ---------------------------------------------------------------------------
+
+def _check_maintainer_change(pkg, pm):
+    """Detect if the latest version was published by a new/unknown user."""
+    if pm not in ("npm", "yarn", "pnpm"):
+        return []
+    data = _get_cached(f"https://registry.npmjs.org/{urllib.parse.quote(pkg, safe='@%')}")
+    if not data:
+        return []
+    versions = data.get("versions", {})
+    time_data = data.get("time", {})
+    if len(versions) < 2:
+        return []
+
+    # Sort versions by publish time
+    ver_times = []
+    for ver, t in time_data.items():
+        if ver in ("created", "modified"):
+            continue
+        ver_times.append((ver, t))
+    ver_times.sort(key=lambda x: x[1])
+    if len(ver_times) < 2:
+        return []
+
+    latest_ver = ver_times[-1][0]
+    latest_user = versions.get(latest_ver, {}).get("_npmUser") or {}
+    if not isinstance(latest_user, dict):
+        return []
+    latest_name = (latest_user.get("name") or "").lower()
+    if not latest_name:
+        return []
+
+    # Collect all previous publishers
+    prev_publishers = set()
+    for ver, _ in ver_times[:-1]:
+        user = versions.get(ver, {}).get("_npmUser") or {}
+        if not isinstance(user, dict):
+            continue
+        name = (user.get("name") or "").lower()
+        if name:
+            prev_publishers.add(name)
+
+    if prev_publishers and latest_name not in prev_publishers:
+        prev_list = ", ".join(sorted(prev_publishers)[:4])
+        return [("high",
+            f"latest version published by '{latest_name}' — "
+            f"all previous versions by: {prev_list} (possible account takeover)")]
+    return []
+
+
+# ---------------------------------------------------------------------------
+# Publication burst detection
+#
+# When an attacker takes over a package, they often push many versions
+# in rapid succession (testing, iterating on the payload, overwriting
+# earlier broken attempts).  Legitimate maintainers rarely push 5+
+# versions in a single day.
+# ---------------------------------------------------------------------------
+
+def _check_publication_burst(pkg, pm):
+    """Flag suspiciously rapid version publishing."""
+    if pm not in ("npm", "yarn", "pnpm", "pip", "pip3", "uv"):
+        return []
+
+    timestamps = []
+    if pm in ("npm", "yarn", "pnpm"):
+        data = _get_cached(f"https://registry.npmjs.org/{urllib.parse.quote(pkg, safe='@%')}")
+        if not data:
+            return []
+        for ver, t in data.get("time", {}).items():
+            if ver in ("created", "modified"):
+                continue
+            try:
+                timestamps.append(datetime.strptime(t[:19], "%Y-%m-%dT%H:%M:%S"))
+            except (ValueError, TypeError):
+                continue
+    elif pm in ("pip", "pip3", "uv"):
+        data = _get_cached(f"https://pypi.org/pypi/{urllib.parse.quote(pkg, safe='')}/json")
+        if not data:
+            return []
+        for files in data.get("releases", {}).values():
+            for f in files:
+                t = f.get("upload_time", "")
+                if t:
+                    try:
+                        timestamps.append(datetime.strptime(t[:19], "%Y-%m-%dT%H:%M:%S"))
+                    except (ValueError, TypeError):
+                        continue
+                break  # one timestamp per release is enough
+
+    if len(timestamps) < 3:
+        return []
+
+    timestamps.sort(reverse=True)
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    recent_24h = sum(1 for t in timestamps if (now - t).total_seconds() < 86400)
+    recent_7d = sum(1 for t in timestamps if (now - t).total_seconds() < 604800)
+
+    if recent_24h >= 5:
+        return [("high", f"{recent_24h} versions published in the last 24 hours — suspicious burst")]
+    if recent_24h >= 3:
+        return [("warn", f"{recent_24h} versions published in the last 24 hours")]
+    if recent_7d >= 10:
+        return [("warn", f"{recent_7d} versions published in the last 7 days — unusual pace")]
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -1147,16 +1391,41 @@ def scan_package(pkg_spec, pm, auto_yes, do_source_scan=True, whitelist=None):
         for sev, msg in ver_issues:
             issues.append((sev, msg))
 
-    # --- 9. Source code scan ---
+    # --- 9. Deprecation check ---
+    if meta.get("found"):
+        for sev, msg in _check_deprecation(pkg, pm, meta):
+            issues.append((sev, msg))
+
+    # --- 10. Maintainer change detection ---
+    if meta.get("found") and pm in ("npm","yarn","pnpm"):
+        print(f"  {D}checking maintainers...{RST}", end="", flush=True)
+        mc_issues = _check_maintainer_change(pkg, pm)
+        if mc_issues:
+            print(f"\r  maintainers: {R}CHANGED{RST}        ")
+        else:
+            print(f"\r  maintainers: {G}OK{RST}        ")
+        for sev, msg in mc_issues:
+            issues.append((sev, msg))
+
+    # --- 11. Publication burst ---
+    if meta.get("found"):
+        for sev, msg in _check_publication_burst(pkg, pm):
+            issues.append((sev, msg))
+
+    # --- 12. Source code scan (integrity + binary + setup.py + patterns) ---
     if do_source_scan and meta.get("found") and pm in ("npm","yarn","pnpm","pip","pip3","uv"):
-        print(f"  {D}scanning source code...{RST}", end="", flush=True)
+        print(f"  {D}scanning source (integrity + binary + code)...{RST}", end="", flush=True)
         src_issues = _scan_source(pkg, pm, meta)
-        if src_issues:
+        # Separate integrity failures from other findings for display
+        integrity_fail = [m for s, m in src_issues if "INTEGRITY" in m]
+        if integrity_fail:
+            print(f"\r  source: {R}INTEGRITY FAILURE{RST}        ")
+        elif src_issues:
             print(f"\r  source: {R}{len(src_issues)} finding(s){RST}        ")
-            for sev, msg in src_issues:
-                issues.append((sev, msg))
         else:
             print(f"\r  source: {G}clean{RST}        ")
+        for sev, msg in src_issues:
+            issues.append((sev, msg))
 
     # --- Display results ---
     print()
@@ -1169,7 +1438,8 @@ def scan_package(pkg_spec, pm, auto_yes, do_source_scan=True, whitelist=None):
     if vulns:
         print()
         for v in vulns[:3]:
-            vid = v.get("aliases", [v.get("id","?")])[0]
+            aliases = v.get("aliases") or []
+            vid = aliases[0] if aliases else v.get("id", "?")
             summary = v.get("summary","")[:75]
             sevs = v.get("severity",[])
             cvss = f" [{sevs[0]['score']}]" if sevs else ""
@@ -1366,9 +1636,8 @@ def _run_cmd(cmd_list):
     risk.  We resolve the executable via shutil.which() and call it directly."""
     exe = shutil.which(cmd_list[0])
     if exe is None:
-        # Fall back to shell=True if we can't find the executable
-        # (better than crashing — the tool is still useful)
-        return subprocess.run(cmd_list, shell=True)
+        print(f"{R}[!] '{cmd_list[0]}' not found in PATH{RST}", file=sys.stderr)
+        return subprocess.CompletedProcess(cmd_list, returncode=127)
     return subprocess.run([exe] + cmd_list[1:])
 
 
